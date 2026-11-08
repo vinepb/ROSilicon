@@ -17,10 +17,9 @@ diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
 index ac705625efc..c5a7fcb439c 100644
 --- a/dlls/winemac.drv/Makefile.in
 +++ b/dlls/winemac.drv/Makefile.in
-@@ -7,6 +7,7 @@ UNIX_LIBS    = \
+@@ -7,5 +7,6 @@ UNIX_LIBS    = \
  	-framework AppKit \
  	-framework Carbon \
- 	-framework CoreVideo \
  	-framework Foundation \
 +	-weak_framework GameController \
  	-framework IOKit \
@@ -247,9 +246,9 @@ index 5fc7168416b..ff3101986dd 100644
      QUERY_EVENT,
      QUERY_EVENT_NO_PREEMPT_WAIT,
 @@ -465,6 +467,8 @@ extern int macdrv_copy_event_from_queue(macdrv_event_queue queue,
- extern int macdrv_register_hot_key(macdrv_event_queue q, unsigned int vkey, unsigned int mod_flags,
+ extern int macdrv_register_hot_key(WineEventQueue *queue, unsigned int vkey, unsigned int mod_flags,
                                     unsigned int keycode, unsigned int modifiers);
- extern void macdrv_unregister_hot_key(macdrv_event_queue q, unsigned int vkey, unsigned int mod_flags);
+ extern void macdrv_unregister_hot_key(WineEventQueue *queue, unsigned int vkey, unsigned int mod_flags);
 +extern void macdrv_start_gcmouse_input(void);
 +extern bool macdrv_gcmouse_input_active(void);
  

@@ -1,0 +1,179 @@
+--- a/rosetta_loader/src/main.cpp
++++ b/rosetta_loader/src/main.cpp
+@@ -36,6 +36,7 @@
+ #include "guest_pc_map.hpp"
+ #include "mach_exception.hpp"
+ #include "offset_finder.hpp"
++#include "owned_recovery_observer.hpp"
+ #include "rosetta_core/Config.h"
+ #include "rosetta_core/ConfigEnv.h"
+ #include "rosetta_core/CoreConfig.h"
+@@ -2547,6 +2548,7 @@
+         // Env wins over the flags: an app bundle can set variables but not argv.
+         sidecar::samplerConfigFromEnv(samplerCfg);
+         sidecar::startSampler(parentTaskPort, runtimeBase, samplerCfg);
++        owned_recovery::start(parentTaskPort, runtimeBase);
+         installSamplerExitSignals(samplerCfg);
+         VERBOSE_LOG("M2: receive thread running; entering kqueue wait\n");
+ 
+@@ -2569,6 +2571,7 @@
+     // Block until the parent (wine) exits, on the watch armed before the
+     // release above.
+     waitExitWatch(exitWatch, parentPid);
++    owned_recovery::stop();
+     // Window after NOTE_EXIT but before kernel reaps the parent task:
+     // mach_vm_read still works against the held task-port send-right.
+     // Use it to pull X87_PROFILE counters back into the .prof file.
+--- a/rosetta_loader/src/owned_recovery_observer.cpp
++++ b/rosetta_loader/src/owned_recovery_observer.cpp
+@@ -0,0 +1,139 @@
++// READ-ONLY observation of this workspace's owned standalone PE only.
++// No state writes, suspend, exception interception, stack walk or map decoder.
++#include "owned_recovery_observer.hpp"
++#include <mach/arm/thread_status.h>
++#include <mach/mach_vm.h>
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <map>
++#include <string>
++#include <thread>
++#include <unistd.h>
++
++namespace owned_recovery {
++namespace {
++constexpr const char *root = "__INVESTIGATION_ROOT__";
++struct ThreadStats { uint64_t samples = 0; std::map<uint64_t,uint64_t> offsets; };
++struct Observer {
++    std::atomic<bool> stopRequested{false};
++    std::thread thread;
++    ~Observer() { if (thread.joinable()) { stopRequested.store(true); thread.join(); } }
++} observer;
++
++bool ownCodeReady(mach_port_t task) {
++    unsigned char code[32]; mach_vm_size_t got = 0;
++    if (mach_vm_read_overwrite(task, 0x25000020, sizeof(code),
++          reinterpret_cast<mach_vm_address_t>(code), &got) != KERN_SUCCESS || got != sizeof(code)) return false;
++    const unsigned char argument[] = {0x8b,0x4c,0x24,4};
++    if (memcmp(code, argument, 4)) return false;
++    for (unsigned i = 4; i < 20; ++i) if (code[i] != 0x90) return false;
++    return code[20] == 0xb8 && (code[21] == 1 || code[21] == 2) &&
++        !code[22] && !code[23] && !code[24] && code[25] == 0x83 && code[26] == 0xf8;
++}
++
++bool recoveryOffset(uint64_t offset) {
++    return (offset >= 0xb5d4 && offset < 0xb63c) || (offset >= 0xb9b8 && offset < 0xba30);
++}
++
++void observe(mach_port_t task, uint64_t base, const std::string& path, pid_t pid) {
++    using Clock = std::chrono::steady_clock;
++    const auto started = Clock::now();
++    bool guarded = false, limited = false;
++    uint64_t guardReads = 0, sweeps = 0, enumerationsFailed = 0, stateReads = 0, stateFailures = 0, idFailures = 0;
++    uint64_t minThreads = UINT64_MAX, maxThreads = 0, recoverySamples = 0;
++    std::map<uint64_t,ThreadStats> threads;
++    while (!observer.stopRequested.load()) {
++        if (Clock::now() - started > std::chrono::seconds(15)) { limited = true; break; }
++        if (!guarded) {
++            ++guardReads;
++            guarded = ownCodeReady(task);
++            if (!guarded) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
++        }
++        thread_act_array_t ports = nullptr; mach_msg_type_number_t count = 0;
++        if (task_threads(task, &ports, &count) != KERN_SUCCESS) { ++enumerationsFailed; break; }
++        ++sweeps; minThreads = std::min(minThreads, uint64_t(count)); maxThreads = std::max(maxThreads, uint64_t(count));
++        for (mach_msg_type_number_t i = 0; i < count; ++i) {
++            thread_identifier_info_data_t id{}; mach_msg_type_number_t idCount = THREAD_IDENTIFIER_INFO_COUNT;
++            const kern_return_t idResult = thread_info(ports[i], THREAD_IDENTIFIER_INFO,
++                reinterpret_cast<thread_info_t>(&id), &idCount);
++            arm_thread_state64_t state{}; mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
++            ++stateReads;
++            const kern_return_t stateResult = thread_get_state(ports[i], ARM_THREAD_STATE64,
++                reinterpret_cast<thread_state_t>(&state), &stateCount);
++            if (idResult != KERN_SUCCESS || !id.thread_id) ++idFailures;
++            if (stateResult != KERN_SUCCESS) ++stateFailures;
++            if (stateResult == KERN_SUCCESS && idResult == KERN_SUCCESS && id.thread_id) {
++                auto& stats = threads[id.thread_id]; ++stats.samples;
++                const uint64_t pc = arm_thread_state64_get_pc(state);
++                if (pc >= base && pc - base < 0x20000) {
++                    const uint64_t offset = pc - base; ++stats.offsets[offset];
++                    recoverySamples += recoveryOffset(offset);
++                }
++            }
++            mach_port_deallocate(mach_task_self(), ports[i]);
++        }
++        vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(ports), count * sizeof(thread_act_t));
++        std::this_thread::sleep_for(std::chrono::microseconds(200));
++    }
++    const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
++    // Exclusive, no-follow creation inside the runner's already-created folder.
++    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
++    if (fd < 0) { fprintf(stderr, "OWNED_RECOVERY: could not exclusively create profile\n"); return; }
++    FILE *out = fdopen(fd, "w");
++    if (!out) { close(fd); fprintf(stderr, "OWNED_RECOVERY: fdopen failed\n"); return; }
++    fprintf(out, "{\n  \"pid\": %d, \"runtime_base\": \"0x%llx\", \"own_code_guarded\": %s,\n", pid,
++        static_cast<unsigned long long>(base), guarded ? "true" : "false");
++    fprintf(out, "  \"elapsed_s\": %.6f, \"guard_reads\": %llu, \"sweeps\": %llu, \"limit_reached\": %s,\n", seconds,
++        static_cast<unsigned long long>(guardReads), static_cast<unsigned long long>(sweeps), limited ? "true" : "false");
++    fprintf(out, "  \"enumeration_failures\": %llu, \"state_reads\": %llu, \"state_failures\": %llu, \"id_failures\": %llu,\n",
++        static_cast<unsigned long long>(enumerationsFailed), static_cast<unsigned long long>(stateReads),
++        static_cast<unsigned long long>(stateFailures), static_cast<unsigned long long>(idFailures));
++    fprintf(out, "  \"min_threads\": %llu, \"max_threads\": %llu, \"recovery_region_samples\": %llu,\n  \"threads\": [\n",
++        static_cast<unsigned long long>(minThreads == UINT64_MAX ? 0 : minThreads),
++        static_cast<unsigned long long>(maxThreads), static_cast<unsigned long long>(recoverySamples));
++    bool firstThread = true;
++    for (const auto& [tid, stats] : threads) {
++        fprintf(out, "%s    {\"tid\": \"0x%llx\", \"samples\": %llu, \"runtime_offsets\": {", firstThread ? "" : ",\n",
++            static_cast<unsigned long long>(tid), static_cast<unsigned long long>(stats.samples));
++        firstThread = false; bool first = true;
++        for (const auto& [offset, n] : stats.offsets) {
++            fprintf(out, "%s\"0x%llx\": %llu", first ? "" : ", ", static_cast<unsigned long long>(offset),
++                static_cast<unsigned long long>(n)); first = false;
++        }
++        fprintf(out, "}}");
++    }
++    fprintf(out, "\n  ],\n  \"interpretation\": \"samples, not exact events; absence does not exclude execution\"\n}\n");
++    const bool failed = ferror(out); const int closed = fclose(out);
++    fprintf(stdout, "OWNED_RECOVERY: guarded=%u sweeps=%llu recovery-samples=%llu write-ok=%u\n", guarded,
++        static_cast<unsigned long long>(sweeps), static_cast<unsigned long long>(recoverySamples), !failed && !closed);
++    fflush(stdout);
++}
++}
++
++void start(mach_port_t task, uint64_t runtimeBase) {
++    const char *path = getenv("X87_OWNED_RECOVERY_PROFILE");
++    if (!path || !*path) return;
++    const char *prefix = getenv("WINEPREFIX");
++    const std::string required = std::string(root) + "/environments/r21-sidecar/prefix";
++    const std::string allowed = std::string(root) + "/runs/owned-recovery-observer-";
++    if (!prefix || required != prefix || std::string(path).find(allowed) != 0 ||
++        std::string(path).find("..") != std::string::npos || !runtimeBase || observer.thread.joinable()) {
++        fprintf(stderr, "OWNED_RECOVERY: refused scope outside the private fixture\n"); return;
++    }
++    pid_t pid = 0;
++    if (pid_for_task(task, &pid) != KERN_SUCCESS || pid <= 0) return;
++    const std::string output = std::string(path) + "." + std::to_string(pid) + ".json";
++    observer.stopRequested.store(false);
++    observer.thread = std::thread(observe, task, runtimeBase, output, pid);
++}
++
++void stop() {
++    observer.stopRequested.store(true);
++    if (observer.thread.joinable()) observer.thread.join();
++}
++}
+--- a/rosetta_loader/src/owned_recovery_observer.hpp
++++ b/rosetta_loader/src/owned_recovery_observer.hpp
+@@ -0,0 +1,8 @@
++#pragma once
++#include <mach/mach.h>
++#include <cstdint>
++namespace owned_recovery {
++// Test-only observer. Default off; exact private prefix + own code guard.
++void start(mach_port_t task, uint64_t runtimeBase);
++void stop();
++}

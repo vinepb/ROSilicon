@@ -539,9 +539,9 @@ index c7e0dc2..f9a6f0d 100644
 +          (unsigned int)status);
 +}
 +
- static NTSTATUS unix_create_stream(void *args)
- {
-     struct create_stream_params *params = args;
+ static HRESULT get_device_period_frame_range(AudioDeviceID dev_id, EDataFlow flow,
+                                              unsigned int *min_period_frames,
+                                              unsigned int *max_period_frames)
 @@ -728,10 +1209,16 @@ static NTSTATUS unix_create_stream(void *args)
          goto end;
      }
@@ -558,8 +558,8 @@ index c7e0dc2..f9a6f0d 100644
 +        stream->dev_id = dev_id_from_device(params->device);
 +    if (stream->flow == eRender) ca_setup_normalize_audio(stream);
 
-     stream->bufsize_frames = muldiv(params->duration, stream->fmt->nSamplesPerSec, 10000000);
-     if(params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
+     if (FAILED(params->result = get_device_period_frame_range(stream->dev_id, stream->flow,
+                                                               &min_period_frames,
 @@ -751,7 +1238,7 @@ static NTSTATUS unix_create_stream(void *args)
          sc = AudioUnitSetProperty(stream->unit, kAudioOutputUnitProperty_SetInputCallback,
                                    kAudioUnitScope_Output, 1, &input, sizeof(input));

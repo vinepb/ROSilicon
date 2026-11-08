@@ -1,0 +1,231 @@
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -514,7 +514,8 @@
+     APC_MAP_VIEW_EX,
+     APC_UNMAP_VIEW,
+     APC_CREATE_THREAD,
+-    APC_DUP_HANDLE
++    APC_DUP_HANDLE,
++    APC_VIRTUAL_INVALIDATE_CODE
+ };
+ 
+ struct user_apc
+@@ -588,6 +589,13 @@
+         client_ptr_t     addr;      /* requested address */
+         mem_size_t       size;      /* requested size */
+     } virtual_flush;
++    struct
++    {
++        enum apc_type    type;      /* APC_VIRTUAL_INVALIDATE_CODE */
++        int              __pad;
++        client_ptr_t     addr;      /* written address */
++        mem_size_t       size;      /* written size */
++    } virtual_invalidate_code;
+     struct
+     {
+         enum apc_type    type;      /* APC_VIRTUAL_LOCK */
+@@ -711,6 +719,11 @@
+         client_ptr_t     addr;      /* resulting address */
+         mem_size_t       size;      /* resulting size */
+     } virtual_flush;
++    struct
++    {
++        enum apc_type    type;      /* APC_VIRTUAL_INVALIDATE_CODE */
++        unsigned int     status;    /* status returned by call */
++    } virtual_invalidate_code;
+     struct
+     {
+         enum apc_type    type;      /* APC_VIRTUAL_LOCK */
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -498,7 +498,8 @@
+     APC_MAP_VIEW_EX,
+     APC_UNMAP_VIEW,
+     APC_CREATE_THREAD,
+-    APC_DUP_HANDLE
++    APC_DUP_HANDLE,
++    APC_VIRTUAL_INVALIDATE_CODE
+ };
+ 
+ struct user_apc
+@@ -578,6 +579,13 @@
+         int              __pad;
+         client_ptr_t     addr;
+         mem_size_t       size;
++    } virtual_invalidate_code;
++    struct
++    {
++        enum apc_type    type;
++        int              __pad;
++        client_ptr_t     addr;
++        mem_size_t       size;
+     } virtual_lock;
+     struct
+     {
+@@ -695,6 +703,11 @@
+         client_ptr_t     addr;
+         mem_size_t       size;
+     } virtual_flush;
++    struct
++    {
++        enum apc_type    type;
++        unsigned int     status;
++    } virtual_invalidate_code;
+     struct
+     {
+         enum apc_type    type;
+@@ -7186,6 +7199,6 @@
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 962
++#define SERVER_PROTOCOL_VERSION 963
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -2078,6 +2078,7 @@
+     case APC_VIRTUAL_ALLOC_EX:
+     case APC_VIRTUAL_FREE:
+     case APC_VIRTUAL_PROTECT:
++    case APC_VIRTUAL_INVALIDATE_CODE:
+     case APC_VIRTUAL_FLUSH:
+     case APC_VIRTUAL_LOCK:
+     case APC_VIRTUAL_UNLOCK:
+--- a/server/trace.c
++++ b/server/trace.c
+@@ -262,6 +262,10 @@
+         dump_uint64( ",size=", &call->virtual_protect.size );
+         fprintf( stderr, ",prot=%x", call->virtual_protect.prot );
+         break;
++    case APC_VIRTUAL_INVALIDATE_CODE:
++        dump_uint64( "APC_VIRTUAL_INVALIDATE_CODE,addr=", &call->virtual_invalidate_code.addr );
++        dump_uint64( ",size=", &call->virtual_invalidate_code.size );
++        break;
+     case APC_VIRTUAL_FLUSH:
+         dump_uint64( "APC_VIRTUAL_FLUSH,addr=", &call->virtual_flush.addr );
+         dump_uint64( ",size=", &call->virtual_flush.size );
+@@ -354,6 +358,10 @@
+         dump_uint64( ",addr=", &result->virtual_protect.addr );
+         dump_uint64( ",size=", &result->virtual_protect.size );
+         fprintf( stderr, ",prot=%x", result->virtual_protect.prot );
++        break;
++    case APC_VIRTUAL_INVALIDATE_CODE:
++        fprintf( stderr, "APC_VIRTUAL_INVALIDATE_CODE,status=%s",
++                 get_status_name( result->virtual_invalidate_code.status ));
+         break;
+     case APC_VIRTUAL_FLUSH:
+         fprintf( stderr, "APC_VIRTUAL_FLUSH,status=%s",
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -6986,19 +6986,31 @@
+  * toggle the executable bit (from inside the target process) on/off for any executable
+  * pages that were modified, to force Rosetta to re-translate it.
+  */
+-static void toggle_executable_pages_for_rosetta( HANDLE process, void *addr, SIZE_T size )
++NTSTATUS virtual_invalidate_code( void *addr, SIZE_T size )
+ {
+     MEMORY_BASIC_INFORMATION info;
+     SIZE_T ret, offset, region_size;
++    NTSTATUS status = STATUS_SUCCESS;
++    sigset_t sigset;
++
++    /* Keep the temporary non-executable state invisible to fault handlers.
++     * virtual_mutex is recursive; both local protection calls and queries
++     * must be inside this one target-side transaction. */
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+     /* Writes can span regions with different current protections. A writable
+      * allocation may become executable later, so AllocationProtect is not
+      * sufficient to decide which translations must be invalidated. */
+     while (size)
+     {
+-        if (NtQueryVirtualMemory( process, addr, MemoryBasicInformation, &info, sizeof(info), &ret )) break;
++        if ((status = NtQueryVirtualMemory( NtCurrentProcess(), addr, MemoryBasicInformation,
++                                           &info, sizeof(info), &ret ))) break;
+         offset = (char *)addr - (char *)info.BaseAddress;
+-        if (offset >= info.RegionSize) break;
++        if (offset >= info.RegionSize)
++        {
++            status = STATUS_INVALID_PARAMETER;
++            break;
++        }
+         region_size = min( size, info.RegionSize - offset );
+ 
+         if (info.Protect & 0xf0)
+@@ -7009,12 +7021,37 @@
+ 
+             /* Remove execute while preserving the access level and modifiers. */
+             noexec = (info.Protect & ~0xf0) | ((info.Protect & 0xf0) >> 4);
+-            if (!NtProtectVirtualMemory( process, &protect_addr, &protect_size, noexec, &origprot ))
+-                NtProtectVirtualMemory( process, &protect_addr, &protect_size, origprot, &noexec );
++            if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_addr, &protect_size,
++                                                  noexec, &origprot ))) break;
++            if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_addr, &protect_size,
++                                                  origprot, &noexec ))) break;
+         }
+         addr = (char *)addr + region_size;
+         size -= region_size;
+     }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    return status;
++}
++
++static void toggle_executable_pages_for_rosetta( HANDLE process, void *addr, SIZE_T size )
++{
++    NTSTATUS status;
++
++    if (process == NtCurrentProcess()) status = virtual_invalidate_code( addr, size );
++    else
++    {
++        union apc_call call;
++        union apc_result result;
++
++        memset( &call, 0, sizeof(call) );
++        call.virtual_invalidate_code.type = APC_VIRTUAL_INVALIDATE_CODE;
++        call.virtual_invalidate_code.addr = wine_server_client_ptr( addr );
++        call.virtual_invalidate_code.size = size;
++        status = server_queue_process_apc( process, &call, &result );
++        if (!status) status = result.virtual_invalidate_code.status;
++    }
++    if (status) WARN( "Failed to invalidate written code in process %p at %p, status %#x\n",
++                      process, addr, status );
+ }
+ #endif
+ 
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -537,6 +537,21 @@
+             result->virtual_protect.prot = prot;
+         }
+         else result->virtual_protect.status = STATUS_INVALID_PARAMETER;
++        break;
++    case APC_VIRTUAL_INVALIDATE_CODE:
++        result->type = call->type;
++        addr = wine_server_get_ptr( call->virtual_invalidate_code.addr );
++        size = call->virtual_invalidate_code.size;
++        if ((ULONG_PTR)addr != call->virtual_invalidate_code.addr || size != call->virtual_invalidate_code.size)
++            result->virtual_invalidate_code.status = STATUS_INVALID_PARAMETER;
++        else
++        {
++#ifdef __APPLE__
++            result->virtual_invalidate_code.status = virtual_invalidate_code( addr, size );
++#else
++            result->virtual_invalidate_code.status = STATUS_NOT_SUPPORTED;
++#endif
++        }
+         break;
+     case APC_VIRTUAL_FLUSH:
+         result->type = call->type;
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -334,6 +334,9 @@
+ extern ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset );
+ extern ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags );
+ extern BOOL virtual_is_valid_code_address( const void *addr, SIZE_T size );
++#ifdef __APPLE__
++extern NTSTATUS virtual_invalidate_code( void *addr, SIZE_T size );
++#endif
+ extern void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t size, EXCEPTION_RECORD *rec );
+ extern BOOL virtual_check_buffer_for_read( const void *ptr, SIZE_T size );
+ extern BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size );

@@ -1,0 +1,44 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -6989,19 +6989,31 @@
+ static void toggle_executable_pages_for_rosetta( HANDLE process, void *addr, SIZE_T size )
+ {
+     MEMORY_BASIC_INFORMATION info;
+-    NTSTATUS status;
+-    SIZE_T ret;
+-
+-    status = NtQueryVirtualMemory( process, addr, MemoryBasicInformation, &info, sizeof(info), &ret );
++    SIZE_T ret, offset, region_size;
+ 
+-    if (!status && (info.AllocationProtect & 0xf0))
++    /* Writes can span regions with different current protections. A writable
++     * allocation may become executable later, so AllocationProtect is not
++     * sufficient to decide which translations must be invalidated. */
++    while (size)
+     {
+-        DWORD origprot, noexec;
+-        noexec = info.AllocationProtect & ~0xf0;
+-        if (!noexec) noexec = PAGE_NOACCESS;
++        if (NtQueryVirtualMemory( process, addr, MemoryBasicInformation, &info, sizeof(info), &ret )) break;
++        offset = (char *)addr - (char *)info.BaseAddress;
++        if (offset >= info.RegionSize) break;
++        region_size = min( size, info.RegionSize - offset );
+ 
+-        NtProtectVirtualMemory( process, &addr, &size, noexec, &origprot );
+-        NtProtectVirtualMemory( process, &addr, &size, origprot, &noexec );
++        if (info.Protect & 0xf0)
++        {
++            void *protect_addr = addr;
++            SIZE_T protect_size = region_size;
++            DWORD origprot, noexec;
++
++            /* Remove execute while preserving the access level and modifiers. */
++            noexec = (info.Protect & ~0xf0) | ((info.Protect & 0xf0) >> 4);
++            if (!NtProtectVirtualMemory( process, &protect_addr, &protect_size, noexec, &origprot ))
++                NtProtectVirtualMemory( process, &protect_addr, &protect_size, origprot, &noexec );
++        }
++        addr = (char *)addr + region_size;
++        size -= region_size;
+     }
+ }
+ #endif

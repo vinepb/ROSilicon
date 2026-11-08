@@ -1,0 +1,26 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -6990,6 +6990,15 @@
+ {
+     MEMORY_BASIC_INFORMATION info;
+     SIZE_T ret, offset, region_size;
++    sigset_t sigset;
++    BOOL self = process == NtCurrentProcess();
++
++    /* Do not expose the temporary non-executable protection to another
++     * thread's fault handler. virtual_mutex is recursive; keeping it over
++     * both local NtProtectVirtualMemory calls makes the transition atomic
++     * with respect to virtual_handle_fault and other protection changes.
++     * Remote APC pairs still require a separate target-side solution. */
++    if (self) server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+     /* Writes can span regions with different current protections. A writable
+      * allocation may become executable later, so AllocationProtect is not
+@@ -7015,6 +7024,7 @@
+         addr = (char *)addr + region_size;
+         size -= region_size;
+     }
++    if (self) server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+ }
+ #endif
+ 

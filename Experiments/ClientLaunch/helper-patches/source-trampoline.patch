@@ -1,0 +1,97 @@
+--- a/rosetta_loader/src/main.cpp
++++ b/rosetta_loader/src/main.cpp
+@@ -2162,7 +2162,13 @@
+                         decodeOpcodeAddr);
+             } else if (dblobs = stub_asm::buildDecodeHook(
+                            decodeHandlerAddr, decodeOpcodeAddr, origDecodePrologue,
+-                           opcode_internal_to_host(kOpcodeName_arpl));
++                           opcode_internal_to_host(kOpcodeName_arpl),
++                           !(std::getenv("X87_TEST_NO_ARPL") &&
++                             std::strcmp(std::getenv("X87_TEST_NO_ARPL"), "1") == 0),
++                           !(std::getenv("X87_TEST_NO_FCOMP") &&
++                             std::strcmp(std::getenv("X87_TEST_NO_FCOMP"), "1") == 0),
++                           std::getenv("X87_TEST_DECODE_TAIL") &&
++                             std::strcmp(std::getenv("X87_TEST_DECODE_TAIL"), "1") == 0);
+                        dblobs.entry.size() != 16 || dblobs.handler.empty()) {
+                 fprintf(stdout, "M2: stub_asm::buildDecodeHook refused the addresses\n");
+             } else if (decodeHandlerAddr + dblobs.handler.size() > padStartAddr + padBytes) {
+@@ -2194,6 +2200,11 @@
+                 decodeBlobEnd = decodeHandlerAddr + dblobs.handler.size();
+                 VERBOSE_LOG("M2: decode_opcode entry patched (abs-jump to 0x%llx, handler %zu B)\n",
+                             decodeHandlerAddr, dblobs.handler.size());
++                VERBOSE_LOG("M2: test decoder paths: ARPL=%s FCOMP=%s\n",
++                    std::getenv("X87_TEST_NO_ARPL") && std::strcmp(std::getenv("X87_TEST_NO_ARPL"), "1") == 0 ? "off" : "on",
++                    std::getenv("X87_TEST_NO_FCOMP") && std::strcmp(std::getenv("X87_TEST_NO_FCOMP"), "1") == 0 ? "off" : "on");
++                VERBOSE_LOG("M2: test decoder tail-original=%s\n",
++                    std::getenv("X87_TEST_DECODE_TAIL") && std::strcmp(std::getenv("X87_TEST_DECODE_TAIL"), "1") == 0 ? "on" : "off");
+             }
+         }
+ 
+--- a/rosetta_loader/src/stub_asm.cpp
++++ b/rosetta_loader/src/stub_asm.cpp
+@@ -1040,7 +1040,8 @@
+ }
+ 
+ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+-                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
++                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode,
++                          bool enableArpl, bool enableFcomp, bool tailOriginal) {
+     StubBlobs blobs;
+ 
+     // The 3-mov+br abs-jump encoding only works while the top 16 bits are zero.
+@@ -1049,9 +1050,6 @@
+     if ((handlerAddr | decodeOpcodeAddr) & 0xFFFF000000000000ULL) {
+         return blobs;
+     }
+-
+-    blobs.entry.reserve(16);
+-    emit_abs_jump_3movs(blobs.entry, handlerAddr);
+ 
+     // ── Instruction indices ─────────────────────────────────────────────────
+     // Named so the branch displacements are derived rather than counted by
+@@ -1062,6 +1060,14 @@
+     constexpr int kSecondCall = 62;  // bl STASH  (substitute decode)
+     constexpr int kDone = 79;        // DONE block
+     constexpr int kCodeInstrs = 82;  // handler code, before STASH
++
++    // Diagnostic-only: keep the exact entry patch but enter the relocated
++    // original prologue directly, with the caller's SP/LR and no wrapper BL,
++    // frame, inspection or postprocessing. Compatibility substitutions are
++    // deliberately bypassed; this is not a proposed shipped fix.
++    blobs.entry.reserve(16);
++    emit_abs_jump_3movs(blobs.entry,
++        tailOriginal ? handlerAddr + kCodeInstrs * 4 : handlerAddr);
+ 
+     // Frame (96 B, keeps sp 16-aligned).  x0..x3 must survive the first call so
+     // the substitute path can re-issue it; code_base/code_end/&insn must
+@@ -1133,14 +1139,16 @@
+     // 19: cmp w9, #0x63               ; ARPL r/m16, r16?
+     emit(h, cmp_imm_w(9, 0x63));
+     // 20: b.eq ARPL
+-    emit(h, b_cond(COND_EQ, kArpl - 20));
++    // Local isolation controls: retain all instruction positions and the
++    // byte-identical default blob, changing only the path-selection branch.
++    emit(h, enableArpl ? b_cond(COND_EQ, kArpl - 20) : 0xD503201FU /* nop */);
+     // 21: cmp w9, #0xDC
+     emit(h, cmp_imm_w(9, 0xDC));
+     // 22: b.ne DONE                   ; anything else Rosetta rejects is handed
+     //     back untouched.  That is the common case by far: Rosetta decodes
+     //     speculatively, past block ends and over data, so INVALID results are
+     //     routine and are not faults.
+-    emit(h, b_cond(COND_NE, kDone - 22));
++    emit(h, enableFcomp ? b_cond(COND_NE, kDone - 22) : b_uncond(kDone - 22));
+ 
+     // ── DC D8: the undocumented FCOMP ST(0) alias ───────────────────────────
+     // Same instruction as the canonical D8 D8, same length, so the substitute
+--- a/rosetta_loader/src/stub_asm.hpp
++++ b/rosetta_loader/src/stub_asm.hpp
+@@ -115,6 +115,8 @@
+ //   hostArplOpcode    : the synthetic ARPL id in the runtime's host numbering,
+ //                        forced into DecodedInsn::mnemonic after a borrowed ADD
+ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+-                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode);
++                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode,
++                          bool enableArpl = true, bool enableFcomp = true,
++                          bool tailOriginal = false);
+ 
+ }  // namespace stub_asm

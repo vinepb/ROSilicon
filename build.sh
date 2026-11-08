@@ -16,9 +16,35 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PKG="$(pwd)"
 
-APP_NAME="ROSilicon"
+APP_NAME="${APP_NAME:-ROSilicon}"
+BUNDLE_ID="${BUNDLE_ID:-com.rosilicon.launcher}"
+DATA_ROOT_NAME="${DATA_ROOT_NAME:-ROSilicon}"
+ISOLATE_WINE_HOME="${ISOLATE_WINE_HOME:-0}"
 APP="${APP_OUT:-$PKG}/$APP_NAME.app"
 EXECUTABLE="ROSilicon"
+ICON_NAME="ROSilicon"
+
+# These values are interpolated into paths and Info.plist below. Keep the
+# supported build interface deliberately narrow rather than trying to escape
+# arbitrary XML or path separators supplied by a caller.
+if [[ -z "$APP_NAME" || "$APP_NAME" == *['/\\<>&']* ]]; then
+    echo "error: invalid APP_NAME: $APP_NAME" >&2
+    exit 2
+fi
+if [[ ! "$BUNDLE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
+    echo "error: invalid BUNDLE_ID: $BUNDLE_ID" >&2
+    exit 2
+fi
+if [[ -z "$DATA_ROOT_NAME" || "$DATA_ROOT_NAME" == "." || "$DATA_ROOT_NAME" == ".." \
+      || "$DATA_ROOT_NAME" == *['/\\:<>&']* ]]; then
+    echo "error: invalid DATA_ROOT_NAME: $DATA_ROOT_NAME" >&2
+    exit 2
+fi
+case "$ISOLATE_WINE_HOME" in
+    0) ISOLATED_WINE_HOME_PLIST='<false/>' ;;
+    1) ISOLATED_WINE_HOME_PLIST='<true/>' ;;
+    *) echo "error: ISOLATE_WINE_HOME must be 0 or 1" >&2; exit 2 ;;
+esac
 
 # The one place the version is written down; the bundle and the .dmg name both
 # come from here.
@@ -112,7 +138,7 @@ X87_SIDECAR="$PKG/Resources/x87sidecar/x87sidecar"
 ROSETTAX87_JIT="$PKG/Resources/rosettax87_jit"
 # The icon, as Icon Composer saves it. Both icons are built from it: macOS 26
 # reads it compiled, older macOS reads the .icns drawn from the same layer.
-ICON_DOCUMENT="$PKG/$APP_NAME.icon"
+ICON_DOCUMENT="$PKG/$ICON_NAME.icon"
 for f in "$DXVK" "$X87_SIDECAR" "$ROSETTAX87_JIT/runtime_loader" \
          "$ROSETTAX87_JIT/libRuntimeRosettax87" "$ROSETTAX87_JIT/LICENSE" \
          "$ICON_DOCUMENT/icon.json"; do
@@ -169,9 +195,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleName</key>              <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>       <string>$APP_NAME</string>
-    <key>CFBundleIdentifier</key>        <string>com.rosilicon.launcher</string>
+    <key>CFBundleIdentifier</key>        <string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key>        <string>$EXECUTABLE</string>
-    <key>CFBundleIconFile</key>          <string>$APP_NAME</string>
+    <key>CFBundleIconFile</key>          <string>$ICON_NAME</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key>           <string>$VERSION</string>
@@ -185,12 +211,14 @@ $(printf '        <string>%s</string>\n' "${LANGUAGES[@]}")
     <key>NSHumanReadableCopyright</key>  <string>GNU General Public License v3.0 or later</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>NSSupportsAutomaticTermination</key><false/>
+    <key>ROSiliconDataDirectoryName</key><string>$DATA_ROOT_NAME</string>
+    <key>ROSiliconIsolatedWineHome</key>$ISOLATED_WINE_HOME_PLIST
 </dict>
 </plist>
 PLIST
 
 echo "==> drawing the icon"
-swift "$PKG/makeicon.swift" "$APP/Contents/Resources/$APP_NAME.icns" \
+swift "$PKG/makeicon.swift" "$APP/Contents/Resources/$ICON_NAME.icns" \
     "$ICON_DOCUMENT" >/dev/null
 
 # macOS 26 takes the icon from the compiled document and renders it as Liquid
@@ -200,17 +228,17 @@ swift "$PKG/makeicon.swift" "$APP/Contents/Resources/$APP_NAME.icns" \
 # catalogue was actually built. actool comes with Xcode; without it the .icns
 # carries the whole job and the build still finishes.
 if ACTOOL="$(xcrun --find actool 2>/dev/null)"; then
-    echo "==> compiling $APP_NAME.icon"
+    echo "==> compiling $ICON_NAME.icon"
     GLASS="$(mktemp -d)"
     "$ACTOOL" "$ICON_DOCUMENT" --compile "$GLASS" --platform macosx \
-        --minimum-deployment-target 26.0 --app-icon "$APP_NAME" \
+        --minimum-deployment-target 26.0 --app-icon "$ICON_NAME" \
         --output-partial-info-plist "$GLASS/partial.plist" \
         --output-format human-readable-text >/dev/null
     # actool writes an .icns of its own beside the catalogue, but only at two
     # sizes; the one drawn above is the one that ships.
     if [[ -f "$GLASS/Assets.car" ]]; then
         cp "$GLASS/Assets.car" "$APP/Contents/Resources/Assets.car"
-        /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string $APP_NAME" \
+        /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string $ICON_NAME" \
             "$APP/Contents/Info.plist" >/dev/null
     else
         echo "warning: actool built no catalogue; the icon will not be Liquid Glass" >&2
@@ -292,7 +320,7 @@ APPLESCRIPT
     # The icon the volume wears on the desktop and in the sidebar. It goes on
     # after the Finder is done: refreshing the window with the custom-icon flag
     # already set makes the Finder delete the .icns and clear the flag again.
-    cp "$APP/Contents/Resources/$APP_NAME.icns" "$MOUNT/.VolumeIcon.icns"
+    cp "$APP/Contents/Resources/$ICON_NAME.icns" "$MOUNT/.VolumeIcon.icns"
     if command -v SetFile >/dev/null 2>&1; then SetFile -a C "$MOUNT"; fi
 
     sync

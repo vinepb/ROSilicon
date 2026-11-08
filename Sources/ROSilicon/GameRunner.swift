@@ -108,14 +108,11 @@ struct GameRunner: Sendable {
     func play() async throws {
         let steamExe = try prepare()
 
-        var environment = paths.wineEnvironment(x87: x87)
-        environment["WINEDLLOVERRIDES"] = "d3d9=n,b"        // DXVK instead of Wine's D3D9
-        environment["MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS"] = "1"
-        environment["DXVK_ASYNC"] = "1"
+        var environment = Self.gameEnvironment(
+            from: paths.wineEnvironment(x87: x87), x87: hook, metalHUD: metalHUD)
         // DXVK renders through MoltenVK, so the overlay Metal itself draws is
         // the one that shows the frame rate of the client.
         if metalHUD {
-            environment["MTL_HUD_ENABLED"] = "1"
             await reporter.log(Strings.logMetalHUD)
         }
         // Anything but the default is said: rosettax87_jit's before the
@@ -147,6 +144,27 @@ struct GameRunner: Sendable {
         if Task.isCancelled { throw CancellationError() }
         guard status == 0 else { throw RunError.exited(status) }
         await reporter.log(Strings.logExitedNormally)
+    }
+
+    /// Game-only defaults, applied before the advanced options. Keeping this
+    /// pure lets tests check the complete launch policy without starting Wine.
+    static func gameEnvironment(
+        from inherited: [String: String], x87: X87Backend, metalHUD: Bool
+    ) -> [String: String] {
+        var environment = inherited
+        environment["WINEDLLOVERRIDES"] = "d3d9=n,b"
+        environment["MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS"] = "1"
+        environment["DXVK_ASYNC"] = "1"
+        if metalHUD { environment["MTL_HUD_ENABLED"] = "1" }
+        if x87 == .sidecar {
+            // The optional decoder substitutions are separate from x87
+            // acceleration. With the updated client, QA reproduced Rosetta's
+            // JIT-breakpoint assertion with them on and reached login with
+            // them off. Keep the normal x87 translator and graphics defaults;
+            // advanced NAME=value options can still override this for testing.
+            environment["X87_NO_DECODE_HOOK"] = "1"
+        }
+        return environment
     }
 
     /// Sets Wine's debug channels and the extra variables, last so they take
